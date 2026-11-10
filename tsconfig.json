@@ -1,0 +1,22 @@
+{
+  // One config: nothing here is built. OpenCode runs the TypeScript source
+  // directly, so this only typechecks `src` and `tests`, and `noEmit` is what
+  // allows the `.ts` import specifiers the host resolves.
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "noUnusedLocals": true,
+    "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"],
+    // The SDK's type files reach into its own dependencies and name
+    // Electron and Solid as peers; only this repo's code is checked.
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

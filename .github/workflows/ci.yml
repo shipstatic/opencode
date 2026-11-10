@@ -1,0 +1,211 @@
+name: CI
+
+# This filename is load-bearing: npm's trusted-publisher registration for this
+# package names the repo AND this workflow file. Renaming ci.yml breaks
+# publishing silently.
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # No `version:` — pnpm/action-setup reads the `packageManager` field,
+      # so the pnpm pin lives in exactly one place.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm exec biome ci .
+
+      - run: pnpm typecheck
+
+      # No build: the package ships its TypeScript source, which OpenCode runs.
+      - run: pnpm test --run
+
+
+  # The publish decision is its own job because `publish`'s `environment:` is
+  # evaluated before any step runs — it can only read another job's outputs.
+  version:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: decide
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+
+          # The VERSION decides the channel: a prerelease (any `-` suffix) goes to
+          # `beta`, so `latest` keeps resolving the last stable release.
+          if [[ "$VERSION" == *-* ]]; then TAG=beta; else TAG=latest; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Idempotence FIRST, because "already released" is true regardless of
+          # which branch is asking — and it is the more informative answer. Order
+          # matters: with the branch check first, every push to an integration
+          # branch after a release told the operator to "merge to main to release
+          # it" for a version already on the registry, and kept saying so until
+          # the next version bump. Once the version is published, any push is a
+          # no-op and says exactly that.
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice title=Already released::$NAME@$VERSION is on the registry — nothing to publish. Bump the version to release again."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The BRANCH decides whether that channel may be published from here.
+          # `latest` is main-only. A stable version on an integration branch is a
+          # STAGED release, and staging one before merging is the normal flow — so
+          # this skips rather than fails, exactly like the idempotence check above.
+          if [[ "$TAG" == "latest" && "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "::notice title=Release staged::$NAME@$VERSION is a stable version. latest publishes only from main, so nothing was published from $GITHUB_REF_NAME. Merge to main to release it."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `npm-latest` carries a main-only deployment branch policy, so publishing
+    # `latest` off `main` is refused by GitHub before a step runs.
+    environment: npm-${{ needs.version.outputs.tag }}
+    # One job, one credential. `id-token` is job-scoped — any step in this job
+    # could mint an OIDC token that npm would exchange for a publish credential
+    # — so this job holds the OIDC grant and nothing else, and runs first-party
+    # steps only. The tag lives in `release`, notification in `notify`, each
+    # with its own lesser permission.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Nothing after checkout touches git, so no credential needs to sit
+          # in .git/config for the lifetime of the OIDC-privileged job.
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v6
+
+      # No `registry-url`: it would write an `_authToken` line into .npmrc, and
+      # npm reads that line — even with no token — as "token auth is configured"
+      # and skips the OIDC handshake (actions/setup-node#1551).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # OIDC needs npm >= 11.5.1; node 22 bundles 10.x, and pnpm has no OIDC
+      # support — hence `npm`, not `pnpm`, for the publish. Exact-pinned like
+      # every tool that emits a published artifact — this one assembles the
+      # tarball and mints the provenance attestation, and it is the only tool
+      # in the pipeline the lockfile cannot hold.
+      - run: npm install -g npm@12.0.2
+
+      # No build step: the package ships its source as written.
+      # `--access` and `--provenance` live in the package's own publishConfig
+      # for the same reason: the publish contract belongs to the package, not to
+      # the one caller that happens to be CI today. The tag is the exception —
+      # it is a property of THIS release, not of the package.
+      #
+      # Trusted publishing: no NODE_AUTH_TOKEN anywhere in this job — npm
+      # authenticates with a token whenever one is present and attempts OIDC
+      # only in its absence.
+      - run: npm publish --tag "${{ needs.version.outputs.tag }}"
+
+  # The registry is the source of truth for "released", so the tag follows the
+  # publish rather than preceding it: a failed publish leaves no tag claiming a
+  # release that does not exist. Its own job, its own credential: it can tag,
+  # and nothing else. No checkout — `gh` talks to the API directly, so no repo
+  # credential exists in this job at all.
+  #
+  # If this job fails after a successful publish, the repair is GitHub's
+  # "Re-run failed jobs": it re-runs exactly this job at the original SHA with
+  # `publish`'s success retained. A later push could not repair it — the tag
+  # must point at the commit that was published.
+  release:
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Tag the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          # A prerelease is marked as one, so `latest` on GitHub means the same
+          # thing it means on npm. The notes are generated from the commits
+          # since the last release — which is why commit subjects are written
+          # to be read.
+          PRERELEASE=""
+          [[ "$VERSION" == *-* ]] && PRERELEASE="--prerelease"
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes \
+            $PRERELEASE
+
+  # Every publish, and every red run on a push, reaches the operator's alerts
+  # channel; a pull request's red already has a reader, its author. The
+  # webhook lives in this job alone, which runs nothing but curl, and an unset
+  # secret fails the job rather than skipping it. The platform's
+  # release rules hold this for every repo.
+  notify:
+    needs: [test, version, publish, release]
+    if: always() && github.event_name != 'pull_request' && (contains(needs.*.result, 'failure') || needs.version.outputs.publish == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Post to the alerts channel
+        env:
+          ALERTS_WEBHOOK: ${{ secrets.ALERTS_WEBHOOK }}
+          PACKAGE: 'opencode-shipstatic'
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+          PUBLISH: ${{ needs.publish.result }}
+          RELEASE: ${{ needs.release.result }}
+        run: |
+          # UNTAGGED is the honest middle state: the version is on the registry
+          # and carries no tag, which "publish failed" would misreport.
+          if [ "$PUBLISH" = skipped ]; then
+            MESSAGE="🔴 $PACKAGE CI failed on $GITHUB_REF_NAME"
+          elif [ "$PUBLISH" != success ]; then
+            MESSAGE="🔴 $PACKAGE $VERSION publish failed"
+          elif [ "$RELEASE" != success ]; then
+            MESSAGE="🟡 $PACKAGE $VERSION published but UNTAGGED: the release job failed. Repair: Re-run failed jobs on this run."
+          else
+            MESSAGE="✅ $PACKAGE $VERSION published ($TAG)"
+          fi
+          [ -n "$ALERTS_WEBHOOK" ] || { echo "::error::ALERTS_WEBHOOK is not set on this repository, so this outcome reached nobody"; exit 1; }
+          curl --fail-with-body -sS --form-string "content=$MESSAGE <$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID>" "$ALERTS_WEBHOOK"
